@@ -10,7 +10,7 @@ class PrioritizedExperienceReplay:
         self.beta = beta
         self.n_features = n_features
 
-        self.memory = np.zeros(shape=(memory_size, n_features * 2 + 2))
+        self.memory = np.zeros(shape=(memory_size, n_features * 2 + 3))
 
         self.memory_count = 0
 
@@ -18,7 +18,12 @@ class PrioritizedExperienceReplay:
         transition = np.hstack((observation, action, reward, observation_, td_error))
         memory_index = self.memory_count % self.memory_size
         self.memory[memory_index, :] = transition
+        self.memory_count += 1
 
     def sample(self):
         sample_probs = self.memory[:, -1] / np.sum(self.memory[:, -1])
-        sample_index = np.random.choice(size=self.batch_size, p=)
+        sample_index = np.random.choice(range(sample_probs.shape[0]), p=sample_probs.ravel(), size=self.batch_size)
+        sample = self.memory[sample_index, :]
+        sample[:, -1] = 1 / (sample[:, -1] / np.sum(sample[:, -1])) / self.batch_size
+        sample[:, -1] = sample[:, -1] / np.max(sample[:, -1])
+        return sample
