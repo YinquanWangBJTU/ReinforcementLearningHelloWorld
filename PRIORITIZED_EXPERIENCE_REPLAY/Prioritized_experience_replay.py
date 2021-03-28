@@ -26,4 +26,4 @@ class PrioritizedExperienceReplay:
         sample = self.memory[sample_index, :]
         sample[:, -1] = 1 / (sample[:, -1] / np.sum(sample[:, -1])) / self.batch_size
         sample[:, -1] = sample[:, -1] / np.max(sample[:, -1])
-        return sample
+        return sample, sample_index
