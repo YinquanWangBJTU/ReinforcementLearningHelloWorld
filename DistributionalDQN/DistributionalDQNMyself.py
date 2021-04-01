@@ -1,166 +1,157 @@
 import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, Softmax, Reshape
+from tensorflow.keras.optimizers import Adam
+import gym
+import random
 import numpy as np
+from collections import deque
 import math
 
 
-class DistributionalDQN:
-    def __init__(self, n_features, n_actions, learning_rate, gamma, e_greedy, v_max, v_min, atoms):
-        self.n_features = n_features
-        self.n_actions = n_actions
-        self.lr = learning_rate
-        self.gamma = gamma
-        self.epsilon = e_greedy
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def store_transition(self, state, action, reward, state_, done):
+        self.buffer.append([state, action, reward, state_, done])
+
+    def sample(self, batch_size):
+        sample = random.sample(self.buffer, batch_size)
+        states, action, rewards, states_, dones = map(
+            np.asarray, zip(*sample)
+        )
+        states = np.array(states).reshape(batch_size, -1)
+        states_ = np.array(states_).reshape(batch_size, -1)
+        return states, action, rewards, states_, dones
+
+    def size(self):
+        return len(self.buffer)
+
+
+class ActionValueModel:
+    def __init__(self, state_dim, action_dim, z, atoms):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.z = z
+        self.atoms = atoms
+
+        self.opt = tf.keras.optimizers.Adam(0.0001)
+        self.criterion = tf.keras.losses.CategoricalCrossentropy()
+        self.model = self.create_model()
+
+    def create_model(self):
+        input_state = Input((self.state_dim, ))
+        h1 = Dense(64, activation='relu')(input_state)
+        h2 = Dense(64, activation='relu')(h1)
+        outputs = []
+        for _ in range(self.action_dim):
+            outputs.append(Dense(self.atoms, activation='softmax')(h2))
+        return tf.keras.Model(input_state, outputs)
+
+    def train(self, x, y):
+        y = tf.stop_gradient(y)
+        with tf.GradientTape() as tape:
+            logits = self.model(x)
+            loss = self.criterion(y, logits)
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.opt.apply_gradients(zip(grads, self.model.trainable_variables))
+
+    def predict(self, state):
+        return self.model.predict(state)
+
+    def get_action(self, state, ep):
+        state = np.reshape(state, [1, self.state_dim])
+        eps = 1. / ((ep / 10) + 1)
+        if np.random.rand() < eps:
+            return np.random.randint(0, self.action_dim)
+        else:
+            return self.get_optimal_action(state)
+
+    def get_optimal_action(self, state):
+        z = self.model.predict(state)
+        z_concat = np.vstack(z)
+        q = np.sum(np.multiply(z_concat, np.array(self.z)), axis=1)
+        return np.argmax(q)
+
+
+class Agent:
+    def __init__(self, env, v_max, v_min, atoms, gamma):
+        self.env = env
+        self.state_dim = env.observation_space.shape[0]
+        self.action_dim = env.action_space.n
+
+        self.buffer = ReplayBuffer()
+        self.batch_size = 8
         self.v_max = v_max
         self.v_min = v_min
         self.atoms = atoms
-        self.delta_z = (self.v_max - self.v_min) / (self.atoms - 1)
+        self.delta_z = float(self.v_max - self.v_min) / (self.atoms - 1)
         self.z = [self.v_min + i * self.delta_z for i in range(self.atoms)]
-        self.z = tf.cast(np.array(self.z), tf.float64)
+        self.gamma = gamma
+        self.q = ActionValueModel(state_dim=self.state_dim, action_dim=self.action_dim,
+                                  z=self.z, atoms=self.atoms)
+        self.q_target = ActionValueModel(state_dim=self.state_dim, action_dim=self.action_dim,
+                                         z=self.z, atoms=self.atoms)
+        self.target_update()
 
-        self._build_net()
-        self.sess = tf.Session()
-        self.sess.run(tf.global_variables_initializer())
+    def target_update(self):
+        weights = self.q.model.get_weights()
+        self.q_target.model.set_weights(weights)
 
-        self.memory_size = 500
-        self.memory = np.zeros(shape=(self.memory_size, n_features * 2 + 2))
-        self.memory_count = 0
+    def replay(self):
+        states, actions, rewards, states_, dones = self.buffer.sample(self.batch_size)
+        z = self.q.predict(states_)
+        z_ = self.q_target.predict(states_)
 
-        self.batch_size = 32
-
-        e_params = tf.get_collection('eval_net')
-        t_params = tf.get_collection('target_net')
-        self.replace_op = [tf.assign(t, e) for t, e in zip(t_params, e_params)]
-        self.replace_count = 100
-        self.train_count = 0
-
-    def _build_net(self):
-        self.state = tf.placeholder(tf.float64, [None, self.n_features], name='state')
-        self.action = tf.placeholder(tf.float64, [None, 1], name='action')
-        self.m_input = tf.placeholder(tf.float64, [None, self.atoms], name='m_input')
-        w_init = tf.random_normal_initializer(0.0, 0.3)
-        b_init = tf.constant_initializer(0.5)
-        with tf.variable_scope('eval_net'):
-            l1 = tf.layers.dense(
-                inputs=self.state,
-                units=24,
-                kernel_initializer=w_init,
-                bias_initializer=b_init,
-                activation=tf.nn.relu,
-                name='l1'
-            )
-            l2 = tf.layers.dense(
-                inputs=l1,
-                units=24,
-                kernel_initializer=w_init,
-                bias_initializer=b_init,
-                activation=tf.nn.relu,
-                name='l2'
-            )
-            with tf.variable_scope('distribution'):
-                self.distribution = tf.layers.dense(
-                    inputs=l2,
-                    units=self.atoms,
-                    kernel_initializer=w_init,
-                    bias_initializer=b_init,
-                    activation=None,
-                    name='action_distribution'
-                )
-
-            with tf.variable_scope('loss'):
-                self.loss = -tf.reduce_sum(self.m_input * tf.log(self.distribution))
-
-            with tf.variable_scope('train'):
-                self.train_op = tf.train.RMSPropOptimizer(self.lr).minimize(self.loss)
-
-            with tf.variable_scope('Q_eval'):
-                self.Q_eval = tf.reduce_sum(self.z * self.distribution)
-
-        self.state_ = tf.placeholder(tf.float64, [None, self.n_features], name='state_')
-        with tf.variable_scope('target_net'):
-            l1 = tf.layers.dense(
-                inputs=self.state,
-                units=24,
-                kernel_initializer=w_init,
-                bias_initializer=b_init,
-                activation=tf.nn.relu,
-                name='l1'
-            )
-            l2 = tf.layers.dense(
-                inputs=l1,
-                units=24,
-                kernel_initializer=w_init,
-                bias_initializer=b_init,
-                activation=tf.nn.relu,
-                name='l2'
-            )
-            with tf.variable_scope('distribution_target'):
-                self.distribution_target = tf.layers.dense(
-                        inputs=l2,
-                        units=self.atoms,
-                        kernel_initializer=w_init,
-                        bias_initializer=b_init,
-                        activation=None,
-                        name='action_distribution'
-                    )
-            with tf.variable_scope('Q_target'):
-                self.Q_target = tf.reduce_sum(self.z * self.distribution_target)
-
-    def choose_action(self, observation):
-        if np.random.uniform() <= self.epsilon:
-            Q_value = [self.sess.run(self.Q_eval, feed_dict={self.state: observation[np.newaxis, :]})
-                       for a in range(self.n_actions)]
-            action = np.argmax(Q_value)
-            return action
-        else:
-            action = np.random.randint(0, self.n_actions)
-            return action
-
-    def learn(self):
-        if self.train_count % self.replace_count == 0:
-            self.sess.run(self.replace_op)
-
-        sample = self.sample()
-        observation = sample[:, :self.n_features]
-        action = sample[:, self.n_features]
-        reward = sample[:, self.n_features + 1]
-        observation_ = sample[:, -self.n_features:]
-
-        list_Q = [self.sess.run(self.Q_eval, feed_dict={self.state: observation_})
-                  for a in range(self.n_actions)]
-        print(list_Q)
-        list_Q = np.vstack(list_Q)
-        q = np.sum(np.multiply(list_Q, np.array(self.z)), axis=1)
-        print(q.shape)
-        q = q.reshape((self.batch_size, self.n_actions), order='F')
-        print(q)
+        z_concat = np.vstack(z)
+        q = np.sum(np.multiply(z_concat, np.array(self.z)), axis=1)
+        q = q.reshape((self.batch_size, self.action_dim), order='F')
         action_ = np.argmax(q, axis=1)
-        print(action_)
+        m_prob = [np.zeros(shape=(self.batch_size, self.atoms)) for i in range(self.action_dim)]
+        for i in range(self.batch_size):
+            if dones[i]:
+                Tz = min(self.v_max, max(self.v_min, rewards[i]))
+                bj = (Tz - self.v_min) / self.delta_z
+                l, u = math.floor(bj), math.ceil(bj)
+                m_prob[actions[i]][i][int(l)] += (u - bj)
+                m_prob[actions[i]][i][int(u)] += (bj - l)
+            else:
+                for j in range(self.atoms):
+                    Tz = min(self.v_max, max(self.v_min, rewards[i] + self.gamma * self.z[j]))
+                    bj = (Tz - self.v_min) / self.delta_z
+                    l, u = math.floor(bj), math.ceil(bj)
+                    m_prob[actions[i]][i][int(l)] += z_[action_[i]][i][int(l)] * (u - bj)
+                    m_prob[actions[i]][i][int(u)] += z_[action_[i]][i][int(u)] * (bj - l)
+        self.q.train(states, m_prob)
 
-        m = np.zeros(shape=(self.batch_size, self.atoms))
-        p = self.sess.run(self.distribution, feed_dict={self.state: observation_[np.newaxis, :],
-                                                        self.action: [[action_]]})
+    def train(self):
+        for i in range(500):
+            done, total_reward, steps = False, 0, 0
+            state = self.env.reset()
+            while not done:
+                action = self.q.get_action(state, steps)
+                next_state, reward, done, info = self.env.step(action)
 
-        for i in range(self.atoms):
-            Tz = min(self.v_max, max(self.v_min, reward + self.gamma * self.z[i]))
+                self.buffer.store_transition(state, action, -1 if done else 0, next_state, done)
 
-            bj = (Tz - self.v_min) / self.delta_z
+                if self.buffer.size() > 1000:
+                    self.replay()
 
-            l, u = math.floor(bj), math.ceil(bj)
-            pj = p[i]
+                if steps % 5 == 0:
+                    self.target_update()
 
-            m[int(l)] += pj * (u - bj)
-            m[int(u)] += pj * (bj - l)
-        self.sess.run(self.train_op, feed_dict={self.state: observation[np.newaxis, :], self.action: [[action]],
-                                                self.m_input: [m]})
-        self.train_count += 0
+                state = next_state
+                steps += 1
+                total_reward += reward
 
-    def store_transition(self, observation, action, reward, observation_):
-        transition = np.hstack((observation, action, reward, observation_))
-        memory_index = self.memory_count % self.memory_size
-        self.memory[memory_index, :] = transition
-        self.memory_count += 1
+            print('Episode: {}| Reward: {}| Steps: {}'.format(i, total_reward, steps))
 
-    def sample(self):
-        batch_index = np.random.randint(low=0, high=self.memory_size, size=self.batch_size)
-        sample = self.memory[batch_index, :]
-        return sample
+
+def run():
+    env = gym.make('CartPole-v0')
+    agent = Agent(env=env, v_max=5, v_min=-5, atoms=8, gamma=0.99)
+    agent.train()
+
+
+if __name__ == '__main__':
+    run()
